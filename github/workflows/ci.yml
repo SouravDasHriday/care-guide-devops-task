@@ -1,0 +1,102 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: care-guide-devops-task
+
+jobs:
+  # ============================================================================
+  # Stage 1: Linting and Unit Testing
+  # ============================================================================
+  lint-and-test:
+    name: Code Linting & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run code linter (flake8)
+        run: |
+          # Check syntax errors and PEP 8 compliance
+          flake8 app/ tests/ --count --max-complexity=10 --max-line-length=88 --statistics
+
+      - name: Run automated unit tests (pytest)
+        run: |
+          pytest -v
+
+      - name: Verify Bash script syntax
+        run: |
+          bash -n scripts/system_health.sh
+
+  # ============================================================================
+  # Stage 2: Build & Push Docker Image
+  # ============================================================================
+  build-and-push:
+    name: Docker Build & Push
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check Docker Hub Credentials
+        id: check_creds
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "has_creds=true" >> "$GITHUB_OUTPUT"
+            echo "target_image=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_creds=false" >> "$GITHUB_OUTPUT"
+            echo "target_image=careguide/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docker Hub credentials not configured. Docker image will be built and verified without pushing."
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.check_creds.outputs.has_creds == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.check_creds.outputs.target_image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ steps.check_creds.outputs.has_creds == 'true' && github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
